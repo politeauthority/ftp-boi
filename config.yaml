@@ -24,7 +24,7 @@ notifications:
     # Do you want this to talk to Slack?
     enabled: True
     # Token from Slack.. should probably look like some dirty mofo like the example below,
-    token: "xoxp-66906178262-66907147904-715461003877-559f32b79aa96ad59d5044f9edfa560e"
+    token: "asfa-52234234234-34234234234-523425697347-23423423423423423423423456972772"
     # Slack channel for this shit
     channel: "#notifi"
     # The name your slack bot talks as
