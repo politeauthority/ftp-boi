@@ -1,0 +1,32 @@
+# Local config
+local:
+  # The name you are giving the process (its possible you may want multiples)
+  instanceName: ftp-boi
+  # The path you locally want files to land at
+  download_path: "/mnt/media-1/download/"
+  # Number of minutes until alerting about a ftp-boi process has held a "lock"
+  # Keep in mind a lock being held for a long period can be indicative of an ftp-boi issue, or a
+  # large download and/or slow network
+  lock_age_alert_min: 1
+
+sftp:
+  host: ftp-boi.google.com
+  user: boi-oy
+  pass: slick-password
+  path: anything/i/can/download
+  removeDownloadedFiles: True
+
+notifications:
+  # Global notifications switch.. right now we only support Slack but w/e?
+  enabled: True
+  # If you have a Slack bot... read on.
+  slack:
+    # Do you want this to talk to Slack?
+    enabled: True
+    # Token from Slack.. should probably look like some dirty mofo like the example below,
+    token: "xoxp-66906178262-66907147904-715461003877-559f32b79aa96ad59d5044f9edfa560e"
+    # Slack channel for this shit
+    channel: "#notifi"
+    # The name your slack bot talks as
+    user: FTP BOI Bot
+    repeatMsgIntervalMin: 1
