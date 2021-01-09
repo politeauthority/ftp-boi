@@ -328,9 +328,7 @@ class SeedboxDownload:
 
         # If a message worth notifying about has been created, send it.
         if self.notifications_enabled and self.slack_enabled and slack_msg:
-            success = self._send_slack(slack_msg)
-            if not success:
-                print('ERROR sending slack message')
+            self._send_slack(slack_msg)
         return True
 
     def _file_if_exists_locally(self, filename: str) -> bool:
@@ -438,6 +436,9 @@ sshpass -p %(password)s sftp %(user)s@%(host)s << !
             print(f"Got an error: {e.response['error']}")
             return False
 
+        self.redis.set('%s-last-message-content' % self.redis_key_base, msg)
+        msg_date = arrow.utcnow().format("YYYY-MM-DD HH:mm:ss")
+        self.redis.set('%s-last-message-ts' % self.redis_key_base, msg_date)
         return True
 
     def _slack_evalutate_msg_worthy(self, msg) -> bool:
@@ -447,7 +448,8 @@ sshpass -p %(password)s sftp %(user)s@%(host)s << !
             - redis values for the keys `seedbox-download-last-message-ts` and 
               `seedbox-download-last-message-content` exist.
             - The current message purposed does match the last message.
-            - This message has been sent to Slack in the last `SLACK_REPEAT_MESSAGE_MIN` minutes.
+            - This message has been sent to Slack in the last `self.slack_repeat_message_min` 
+              minutes.
 
            If all those conditions are met, we will NOT send a message to slack.
 
@@ -475,9 +477,9 @@ sshpass -p %(password)s sftp %(user)s@%(host)s << !
 
         # If the message IS a duplicate of the last, and HAS been sent in minutes, do NOT repeat 
         last_slack_msg_ts = arrow.get(last_slack_msg_ts)
-        delta = arrow.now() - timedelta(minutes=SLACK_REPEAT_MESSAGE_MIN)
+        delta = arrow.now() - timedelta(minutes=self.slack_repeat_message_min)
         if not last_slack_msg_ts < delta:
-            print('NOT SENC dupe message but its been %s minutes' % SLACK_REPEAT_MESSAGE_MIN)
+            print('NOT SENC dupe message but its been %s minutes' % self.slack_repeat_message_min)
 
             return False
 
