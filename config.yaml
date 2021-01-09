@@ -3,11 +3,15 @@ local:
   # The name you are giving the process (its possible you may want multiples)
   instanceName: ftp-boi
   # The path you locally want files to land at
-  download_path: "/mnt/media-1/download/"
+  download_path: "/mnt/media-1/download/complete"
+  # The path you locally want files to land at
+  download_tmp_path: "/mnt/media-1/download/tmp"
   # Number of minutes until alerting about a ftp-boi process has held a "lock"
   # Keep in mind a lock being held for a long period can be indicative of an ftp-boi issue, or a
   # large download and/or slow network
   lock_age_alert_min: 1
+  # Free space requirement in gigs of the local device, if not available stop download process
+  freeSpaceRequired: 200
 
 sftp:
   host: ftp-boi.google.com

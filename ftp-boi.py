@@ -20,62 +20,54 @@ Requirements:
     pyyaml-5.3.1
 
 Redis Keys
- - seedbox-download-lock
- - seedbox-download-lock-date
- - seedbox-download-last-message-ts
- - seedbox-download-last-message-content
+ - ftp-boi-lock
+ - ftp-boi-lock-date
+ - ftp-boi-last-message-ts
+ - ftp-boi-last-message-content
 
 Features to build
-    - dertmine local freespace and STOP DL if it exceeds that
+    - add config for local redis
+    - determine local free space and STOP DL if it exceeds that
     - ALLOW CLI args such as --delete to remove lock key from redis
     -  Delete from remote  recursively, or some what
     - download files in remote dir that are NOT folders, ie a reademe.txt
-
     - check download size
         - make sure this doesnt exceed local vol
-
-    - create python constant to decide wheather or not to delete files from remote.
-      SFTP_DELETE_REMOTE_COPY
-
-    - determine  external root "file" size
-
-    print("[%s]" % (arrow.now()))
 
 """
 import argparse
 from datetime import timedelta
 import os
+import shutil
 import subprocess
 
 import arrow
 import pysftp
 import redis
-import slack
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 import yaml
 
 
-# Slack config
-SLACK_ENABLED = False
-
-# Typically  this can remain constant, unless you have a multiple instances of this script
-REDIS_KEY_BASE = "seedbox-download-beta"
-
 class SeedboxDownload:
 
-    def __init__(self):
+    def __init__(self, args):
+        self.args = args
         self.downloads = []
         self.redis = redis.Redis(host='localhost', port=6379, db=0)
         self.notifications = []
+        self.move_after_download = False
 
     def run(self, args):
         print("\n[%s] Starting SeedBox Download" % arrow.now())
         self.read_config()
-        self.prep_run()
-        if not self.check_lock():
+        run_prepped = self.prep_run()
+        if not self.check_lock() and run_prepped:
             self.create_lock()
             self.stage_download()
             self.delete_lock()
-        # self.report()
+            # self.cleanup()
+        self.report()
         print('[%s] Finished' % arrow.now())
 
     def read_config(self):
@@ -86,23 +78,13 @@ class SeedboxDownload:
            @todo: CLI support
            @note: Future  versions will  allow this to be supplemented via CLI args.
         """
-        self.redis_key_base = REDIS_KEY_BASE
-        self.slack_enabled = SLACK_ENABLED
+        print("[%s] DEBUG - Using config file: %s" % (arrow.now(), self.args.config))
 
-        self.config_path = None
+        if not os.path.exists(self.args.config):
+            print("ERROR: cannot find config file: %s" % self.args.config)
+            exit()
 
-        if not self.config_path:
-            current_script_dir = os.path.dirname(os.path.realpath(__file__))
-            expected_config_loc = os.path.join(current_script_dir, 'config.yaml')
-            if not os.path.exists(expected_config_loc):
-                print("ERROR: cannot find config file: %s" % expected_config_loc)
-                exit()
-            self.config_path = expected_config_loc
-
-
-        print("[%s] DEBUG - Using config file: %s" % (arrow.now(), self.config_path))
-
-        with open(self.config_path) as file:
+        with open(self.args.config) as file:
             # The FullLoader parameter handles the conversion from YAML
             # scalar values to Python the dictionary format
             config_yaml = yaml.load(file, Loader=yaml.FullLoader)
@@ -110,15 +92,22 @@ class SeedboxDownload:
         if 'local' not in config_yaml:
             return _config_error('local')
 
-        # Locals !
-        if config_yaml['local']['download_path']:
-            self.local_path = config_yaml['local']['download_path']
-        if config_yaml['local']['lock_age_alert_min']:
-            self.lock_age_alert_min = config_yaml['local']['lock_age_alert_min']
-        if 'redisKeyBase' in config_yaml['local']:
+        # Locals config
+        if config_yaml['local']['downloadPath']:
+            self.local_path = config_yaml['local']['downloadPath']
+        if config_yaml['local']['downloadTmpPath']:
+            self.local_path_tmp = config_yaml['local']['downloadTmpPath']
+            self.move_after_download = True
+        if config_yaml['local']['lockAgeAlertMin']:
+            self.lock_age_alert_min = config_yaml['local']['lockAgeAlertMin']
+        if 'instanceName' in config_yaml['local']:
             self.redis_key_base = config_yaml['local']['instanceName']
 
-        # Remote
+        self.free_space_required = None
+        if 'freeSpaceRequired' in config_yaml['local']:
+            self.free_space_required = config_yaml['local']['freeSpaceRequired']
+
+        # Remote config
         if config_yaml['sftp']['host']:
             self.sftp_host = config_yaml['sftp']['host']
         if config_yaml['sftp']['user']:
@@ -130,33 +119,75 @@ class SeedboxDownload:
         if config_yaml['sftp']['removeDownloadedFiles']:
             self.sftp_remove_files = config_yaml['sftp']['removeDownloadedFiles']
 
-        if config_yaml['notifications']['enabled']:
-            self.notifications_enabled = True
+        # Notification config
+        if 'enabled' in config_yaml['notifications']:
+            self.notifications_enabled = config_yaml['notifications']['enabled']
 
-            self.slack_enabled = config_yaml['notifications']['slack']['enabled']
-            if self.slack_enabled:
-                self.slack_token = config_yaml['notifications']['slack']['token']
-                self.slack_channel = config_yaml['notifications']['slack']['channel']
-                self.slack_user = config_yaml['notifications']['slack']['user']
-                self.slack_repeat_message_min = config_yaml['notifications']['slack']['repeatMsgIntervalMin']
-            
-    def prep_run(self):
-        print("[%s] Remote Host:\t\t%s" % (arrow.now(), self.sftp_host))
-        print("[%s] Remote Path:\t\t%s" % (arrow.now(), self.sftp_path))
+            if self.notifications_enabled:
+                self.slack_enabled = config_yaml['notifications']['slack']['enabled']
+                if self.slack_enabled:
+                    self.slack_token = config_yaml['notifications']['slack']['token']
+                    self.slack_channel = config_yaml['notifications']['slack']['channel']
+                    self.slack_user = config_yaml['notifications']['slack']['user']
+                    self.slack_repeat_message_min = config_yaml['notifications']['slack']['repeatMsgIntervalMin']
+        return True
+
+    def prep_run(self) -> bool:
+        """ """
+
+        # Check local download path exists and will work
+        if not os.path.exists(self.local_path):
+            print('[%s] ERROR - Local download path does not exist: "%s"' % (
+                arrow.now(),
+                self.local_path))
+            return False
+
+        if self.move_after_download:
+            if not os.path.exists(self.local_path_tmp):
+                print('[%s] ERROR - Local download tmp path does not exist: "%s"' % (
+                    arrow.now(),
+                    self.local_path_tmp))
+                return False
+
+        if self.free_space_required:
+            free_gigs = self._get_free_local_gigs(self.local_path)
+            print('[%s] Free local space:\t\t%s gigs' % (arrow.now(), free_gigs))
+            if free_gigs < self.free_space_required:
+                msg = "Not enough free space on device"
+                print('[%s] ERROR - %s' % (
+                    arrow.now(),
+                    msg))
+                self.notifications.append({
+                    "type": "error",
+                    "message": msg,
+                })
+                return False
+
+        print("[%s] Remote Host:\t\t\t%s" % (arrow.now(), self.sftp_host))
+        print("[%s] Remote Path:\t\t\t%s" % (arrow.now(), self.sftp_path))
         if self.sftp_remove_files:
             remote_delete_msg = "YES"
         else:
             remote_delete_msg = "NO"
-        print("[%s] Remote Delete Files:\t%s" % (arrow.now(), remote_delete_msg))
+        print("[%s] Remote Delete Files:\t\t%s" % (arrow.now(), remote_delete_msg))
 
-        print("[%s] Local Path:\t\t%s" % (arrow.now(), self.local_path))
+        if not self.move_after_download:
+            print("[%s] Local Path:\t\t%s" % (arrow.now(), self.local_path))
+        else:
+            print("[%s] Local Temp Path:\t\t%s" % (arrow.now(), self.local_path_tmp))
+            print("[%s] Local Completed Path:\t%s" % (arrow.now(), self.local_path))
         # @todo: figure this out
         # print("[%s] Local Free Space:\t%s(someting)" % (arrow.now(), 'x'))
-        print("[%s] Redis Lock Name:\t%s-lock" % (arrow.now(), self.redis_key_base))
+        print("[%s] Redis Lock Name:\t\t%s-lock" % (arrow.now(), self.redis_key_base))
         print("\n")
 
         # print("[%s] Remote Host:]\t%s" % (arrow.now()))
         return True
+
+    def _get_free_local_gigs(self, path) -> float:
+        statvfs = os.statvfs(self.local_path)
+        free = round((statvfs.f_frsize * statvfs.f_bfree) / 1024 / 1024 / 1024, 2)
+        return free
 
     def check_lock(self) ->  bool:
         """Check if the LOCK_FILE_PATH file exists, if it does, do not run. """
@@ -213,6 +244,7 @@ class SeedboxDownload:
            by `self.sftp_path`. After downloading each file, try to delete the file from the
            remote.
         """
+
         print("[%s] Connecting to host: %s" % (arrow.now(), self.sftp_host))
         self.sftp = pysftp.Connection(
             self.sftp_host,
@@ -227,6 +259,9 @@ class SeedboxDownload:
         else:
             print("[%s] Nothing on remote file system to download." % arrow.now())
             return True
+
+        ## If we have anything to downloads
+        ## see if our download_tmp_path config existst
 
         # For each file, handle pulling them down and then removing them from the remote
         for attr in directory_structure:
@@ -248,12 +283,23 @@ class SeedboxDownload:
        # Download
         print('[%s] Downloading: "%s"' % (arrow.now(), filename))
         remote_file = os.path.join(self.sftp_path, filename)
+
+        local_path = self.local_path
+        if self.move_after_download:
+            local_path = self.local_path_tmp
+
         with self.sftp.cd(self.sftp_path):
-            self.sftp.get_r(filename, localdir=self.local_path)
+            self.sftp.get_r(filename, localdir=local_path)
         print('[%s] Completed Download "%s"' % (arrow.now(), filename))
         self.downloads.append(filename)
 
-        # Delete
+        # Move file to completed downloads location if enabled
+        if self.move_after_download:
+            source = os.path.join(self.local_path_tmp, filename)
+            destination = os.path.join(self.local_path, filename)
+            dest = shutil.move(source, destination)
+
+        # Delete Remote
         if self.sftp_remove_files:
             self._recursive_delete(filename)
 
@@ -265,12 +311,13 @@ class SeedboxDownload:
 
     def report(self) -> bool:
         """Report out the downloads performed. """
+        print('Report')
         slack_msg = ""
         if self.downloads:
             print('[%s] All downloads completed.' % arrow.now())
             slack_msg += "Downloaded\n"
         for download in self.downloads:
-            msg = '[%s] %s"' % (arrow.now(), download)
+            msg = '[%s] %s' % (arrow.now(), download)
             print(msg)
             slack_msg += " - `%s`" % download + "\n"
 
@@ -280,8 +327,10 @@ class SeedboxDownload:
                 slack_msg += " - %s" % notification['message']
 
         # If a message worth notifying about has been created, send it.
-        if slack_msg and SLACK_ENABLED:
-            self._send_slack(slack_msg)
+        if self.notifications_enabled and self.slack_enabled and slack_msg:
+            success = self._send_slack(slack_msg)
+            if not success:
+                print('ERROR sending slack message')
         return True
 
     def _file_if_exists_locally(self, filename: str) -> bool:
@@ -292,6 +341,15 @@ class SeedboxDownload:
             print('[%s] Warning: %s' % (arrow.now(), msg))
             self.notifications.append({'type': 'warning', 'message': msg})
             return True
+
+        if self.move_after_download:
+            local_file_path_tmp = os.path.join(self.local_path_tmp, filename)
+            if os.path.exists(local_file_path):
+                msg = '"%s" already exists locally in tmp, logging this and skipping.' % filename
+                print('[%s] Warning: %s' % (arrow.now(), msg))
+                self.notifications.append({'type': 'warning', 'message': msg})
+                return True
+
         return False
 
     def _recursive_delete(self, filename: str):
@@ -300,7 +358,9 @@ class SeedboxDownload:
            IE /downloads/complete/some_movie
            IE /downloads/complete/some_movie/subs
         """
-        print('[%s] Starting remote delete for: "%s"' %  (arrow.now(), filename))
+        print('[%s] Starting remote delete for: "%s"' %  (
+            arrow.now(),
+            os.path.join(self.sftp_path, filename)))
         sub_dirs_to_delete = []
         sub_sub_dirs_to_delete = []
         sub_sub_sub_dirs_to_delete = []
@@ -352,7 +412,7 @@ sshpass -p %(password)s sftp %(user)s@%(host)s << !
             "remote_path": remote_path,
             "dir": dir_name,
             "user": self.sftp_user,
-            "password": self.sftp_path,
+            "password": self.sftp_pass,
             "host": self.sftp_host,
         }
         return cmd
@@ -365,18 +425,19 @@ sshpass -p %(password)s sftp %(user)s@%(host)s << !
             print(msg)
             return False
 
-        slack_client = slack.WebClient(token=SLACK_TOKEN)
-        print('Sending: %s' % msg)
-        slack_client.chat_postMessage(
-            username=SLACK_USER,
-            channel=SLACK_CHANNEL,
-            text=msg
-        )
-        current_time = str(arrow.now())
-        self.redis.set('%s-last-message-ts' % self.redis_key_base, current_time)
-        self.redis.set('%s-last-message-content' % self.redis_key_base, msg)
-        print("[%s] Sending slack msg" % arrow.now())
-        print(msg)
+        client = WebClient(token=self.slack_token)
+
+        try:
+            response = client.chat_postMessage(channel=self.slack_channel, text=msg)
+            # assert response["message"]["text"] == msg
+            print("Sent slack message")
+        except SlackApiError as e:
+            # You will get a SlackApiError if "ok" is False
+            assert e.response["ok"] is False
+            assert e.response["error"]  # str like 'invalid_auth', 'channel_not_found'
+            print(f"Got an error: {e.response['error']}")
+            return False
+
         return True
 
     def _slack_evalutate_msg_worthy(self, msg) -> bool:
@@ -398,7 +459,7 @@ sshpass -p %(password)s sftp %(user)s@%(host)s << !
         last_slack_msg_content = self.redis.get('%s-last-message-content' % self.redis_key_base)
 
         if not last_slack_msg_ts or not last_slack_msg_content:
-            return  False
+            return  True
 
         last_slack_msg_ts = last_slack_msg_ts.decode()
         last_slack_msg_content = last_slack_msg_content.decode()
@@ -432,13 +493,18 @@ sshpass -p %(password)s sftp %(user)s@%(host)s << !
 
 
 def parse_args():
-    """ """
+    """Parse CLI args. """
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-c",
+        "--config",
+        default=False,
+        help="Config file to use.")
     parser.add_argument(
         "--delete",
         default=False,
         action='store_true',
-        help="Selects against all running and stopped containers")
+        help="Delete lock if it exists allowing Ftp Boi to run.")
     parser.add_argument(
         "-v",
         "--version",
@@ -448,12 +514,14 @@ def parse_args():
 
     args = parser.parse_args()
 
-    import ipdb; ipdb.set_trace()
+    if not args.config:
+        args.config = os.path.join(os.path.dirname(os.path.realpath(__file__)), "config.yaml")
+
     return args
 
-if __name__ == "__main__":
-    # args = parse_args()
-    # exit()
-    SeedboxDownload().run({})
 
-# End File: seedbox-download.py
+if __name__ == "__main__":
+    args = parse_args()
+    SeedboxDownload(args).run({})
+
+# End File: ftp-boi/ftp-boi.py
