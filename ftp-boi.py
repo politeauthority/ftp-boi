@@ -27,7 +27,7 @@ Redis Keys
 
 Features to build
     - add config for local redis
-    - determine local free space and STOP DL if it exceeds that
+    - determine local free space BETTER and STOP DL if it exceeds that
     - ALLOW CLI args such as --delete to remove lock key from redis
     -  Delete from remote  recursively, or some what
     - download files in remote dir that are NOT folders, ie a reademe.txt
@@ -54,6 +54,7 @@ class SeedboxDownload:
     def __init__(self, args):
         self.args = args
         self.downloads = []
+        self.to_download = []
         self.redis = redis.Redis(host='localhost', port=6379, db=0)
         self.notifications = []
         self.move_after_download = False
@@ -61,10 +62,15 @@ class SeedboxDownload:
     def run(self, args):
         print("\n[%s] Starting SeedBox Download" % arrow.now())
         self.read_config()
+        if self.args.delete:
+            delete = self.handle_delete()
+            exit(0)
+
         run_prepped = self.prep_run()
         if not self.check_lock() and run_prepped:
             self.create_lock()
-            self.stage_download()
+            if self.prep_downloads():
+                self.run_downloads()
             self.delete_lock()
             # self.cleanup()
         self.report()
@@ -130,6 +136,13 @@ class SeedboxDownload:
                     self.slack_channel = config_yaml['notifications']['slack']['channel']
                     self.slack_user = config_yaml['notifications']['slack']['user']
                     self.slack_repeat_message_min = config_yaml['notifications']['slack']['repeatMsgIntervalMin']
+        return True
+
+    def handle_delete(self) -> bool:
+        """ """
+        lock_name = "%s-lock" % self.redis_key_base
+        self.redis.delete(lock_name)
+        print("[%s] Deleted lock: %s" % (arrow.now(), lock_name))
         return True
 
     def prep_run(self) -> bool:
@@ -239,7 +252,7 @@ class SeedboxDownload:
         seedbox_lock = self.redis.set('%s-lock-date' % self.redis_key_base, lock_date)
         return True
 
-    def stage_download(self) -> bool:
+    def prep_downloads(self) -> bool:
         """Connect to remote SFTP host and look for files to download in the directory specified
            by `self.sftp_path`. After downloading each file, try to delete the file from the
            remote.
@@ -260,8 +273,6 @@ class SeedboxDownload:
             print("[%s] Nothing on remote file system to download." % arrow.now())
             return True
 
-        ## If we have anything to downloads
-        ## see if our download_tmp_path config existst
 
         # For each file, handle pulling them down and then removing them from the remote
         for attr in directory_structure:
@@ -271,12 +282,21 @@ class SeedboxDownload:
             if self._file_if_exists_locally(filename):
                 continue
 
+            self.to_download.append(filename)
+
+        if self.to_download:
+            return True
+        else:
+            return False
+
+    def run_downloads(self):
+        """ """
+        print("[%s] Planning to download:" % arrow.now())
+        for filename in self.to_download:
+            print('\t"%s"' % filename)
+        for filename in self.to_download:
             self.download_entity(filename)
-
-        if self.downloads:
-            print("[%s] Downloads successful" % arrow.now())
-
-        return True
+        print("[%s] Downloads successful" % arrow.now())
 
     def download_entity(self, filename: str) -> bool:
         """Do this better. """
@@ -362,26 +382,48 @@ class SeedboxDownload:
         sub_dirs_to_delete = []
         sub_sub_dirs_to_delete = []
         sub_sub_sub_dirs_to_delete = []
+
+        # First directory
+        # ie og dir
         with self.sftp.cd(os.path.join(self.sftp_path, filename)):
             directory_structure = self.sftp.listdir_attr()
-            for thing in directory_structure:
-                if thing.st_size != 4096:
+            for sub in directory_structure:
+                if sub.st_size != 4096:
                     continue
                 sub_dirs_to_delete.append(os.path.join(
                     self.sftp_path,
                     filename,
-                    thing.filename))
+                    sub.filename))
 
-                with self.sftp.cd(os.path.join(self.sftp_path, filename, thing.filename)):
+                # Second directory
+                with self.sftp.cd(os.path.join(self.sftp_path, filename, sub.filename)):
                     directory_structure = self.sftp.listdir_attr()
-                    for sub_thing in directory_structure:
-                        if sub_thing.st_size != 4096:
+                    for sub_sub in directory_structure:
+                        if sub_sub.st_size != 4096:
                             continue
                         sub_sub_dirs_to_delete.append(os.path.join(
                             self.sftp_path,
                             filename,
-                            thing.filename,
-                            sub_thing.filename))
+                            sub.filename,
+                            sub_sub.filename))
+
+                        # Third Directory
+                        with self.sftp.cd(os.path.join(self.sftp_path, filename, sub.filename, sub_sub.filename)):
+                            directory_structure = self.sftp.listdir_attr()
+                            for sub_sub_sub in directory_structure:
+                                if sub_sub_sub.st_size != 4096:
+                                    continue
+                                sub_sub_sub_dirs_to_delete.append(os.path.join(
+                                    self.sftp_path,
+                                    filename,
+                                    sub.filename,
+                                    sub_sub.filename,
+                                    sub_sub_sub.filename))
+
+
+        for sub_sub_sub_dir  in sub_sub_sub_dirs_to_delete:
+            cmd = self._get_rm_dir_command(sub_sub_sub_dir, sub_dir=True)
+            response = subprocess.check_output(cmd, shell=True).decode()
 
         for sub_sub_dir  in sub_sub_dirs_to_delete:
             cmd = self._get_rm_dir_command(sub_sub_dir, sub_dir=True)
@@ -503,6 +545,7 @@ def parse_args():
         default=False,
         help="Config file to use.")
     parser.add_argument(
+        "-d",
         "--delete",
         default=False,
         action='store_true',
